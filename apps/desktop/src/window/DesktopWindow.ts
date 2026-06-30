@@ -298,6 +298,23 @@ export const make = Effect.gen(function* () {
 
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
+      window.setWindowButtonVisibility(true);
+      // Native liquid-glass backdrop (the built-in Electron `vibrancy` is unreliable on
+      // recent macOS + conflicts with the hiddenInset titlebar). Lazy-loaded and fully
+      // guarded: a packaging/load failure must NEVER break window creation. The frost
+      // only shows where the web content is translucent (the Window-opacity slider).
+      window.webContents.once("did-finish-load", () => {
+        void (async () => {
+          try {
+            const glass = (await import("electron-liquid-glass")).default;
+            if (glass.isGlassSupported()) {
+              glass.addView(window.getNativeWindowHandle(), { cornerRadius: 10 });
+            }
+          } catch {
+            // Best-effort: missing/unsupported glass backdrop must not break the window.
+          }
+        })();
+      });
     }
 
     // Grant the app's own renderer the permissions it requests — notably the

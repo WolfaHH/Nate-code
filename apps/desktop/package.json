@@ -22,6 +22,7 @@
     "@t3tools/tailscale": "workspace:*",
     "effect": "catalog:",
     "electron": "41.5.0",
+    "electron-liquid-glass": "^1.1.1",
     "electron-store": "^8.2.0",
     "electron-updater": "^6.6.2",
     "playwright-core": "1.60.0",
@@ -35,5 +36,5 @@
     "tailwindcss": "^4.0.0",
     "vite-plus": "catalog:"
   },
-  "productName": "T3 Code (Alpha)"
+  "productName": "NateCode (Alpha)"
 }
