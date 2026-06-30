@@ -193,17 +193,15 @@ function terminalThemeFromApp(mountElement?: HTMLElement | null, backgroundOpaci
   const bg = applyTerminalAlpha(background, backgroundOpacity);
 
   if (isDark) {
-    // Match Nate's Ghostty config exactly (~/.config/ghostty/config): muted grays
-    // with subtle accents, fg #b0b0b0, white bar cursor. Keeps the app-derived
-    // background blend + opacity so the surface still belongs to the app chrome.
+    // Follow the active palette: background + foreground come from the app's resolved
+    // --background / --foreground tokens (so the terminal tracks the chosen theme,
+    // not a hard-coded near-black). The accent ramp below stays fixed — it's a tuned
+    // ANSI palette for claude's coloured output, which the themes don't redefine.
     return {
-      background: applyTerminalAlpha("rgb(5, 5, 5)", backgroundOpacity),
-      // Brighter than raw Ghostty (#b0b0b0): with an opaque surface the text should
-      // read crisp white, and the accents punchier — the muted Ghostty values looked
-      // washed out behind xterm's transparency rendering.
-      foreground: "rgb(228, 228, 228)",
-      cursor: "rgb(255, 255, 255)",
-      cursorAccent: "rgb(5, 5, 5)",
+      background: bg,
+      foreground,
+      cursor: foreground,
+      cursorAccent: background,
       selectionBackground: "rgba(90, 90, 90, 0.9)",
       selectionForeground: "rgb(255, 255, 255)",
       selectionInactiveBackground: "rgba(90, 90, 90, 0.5)",
@@ -494,6 +492,35 @@ export function TerminalViewport({
     if (activeFitAddon) fitTerminalSafely(activeFitAddon);
     activeTerminal.refresh(0, activeTerminal.rows - 1);
   }, [terminalFontFamily, terminalFontSize, terminalBackgroundOpacity]);
+
+  // Re-apply the terminal theme when the app's palette/mode changes. applyPalette writes
+  // inline CSS vars on <html> and the light/dark toggle flips its class; without watching
+  // those, the live terminal keeps its creation-time colors and ignores a theme switch.
+  useEffect(() => {
+    let frame: number | null = null;
+    const applyTheme = () => {
+      frame = null;
+      const activeTerminal = terminalRef.current;
+      if (!activeTerminal) return;
+      const opacity = appearanceRef.current.bgOpacity;
+      activeTerminal.options.theme = terminalThemeFromApp(
+        containerRef.current,
+        opacity < 90 ? opacity / 100 : 1,
+      );
+      activeTerminal.refresh(0, activeTerminal.rows - 1);
+    };
+    const observer = new MutationObserver(() => {
+      if (frame === null) frame = window.requestAnimationFrame(applyTheme);
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style"],
+    });
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     const mount = containerRef.current;
