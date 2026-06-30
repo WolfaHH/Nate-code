@@ -77,7 +77,8 @@ import { isElectron } from "../env";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
 import { isScratchChatsProject, useNewScratchChat } from "../scratchChats";
 import { setAgentSoundsVolume, useAgentSounds } from "../sounds";
-import { applyPalette } from "../theme/palette";
+import { applyPalette, resolvePalettePreset } from "../theme/palette";
+import { useTheme } from "~/hooks/useTheme";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { isMacPlatform } from "../lib/utils";
@@ -3165,8 +3166,16 @@ export default function Sidebar() {
   }, [agentSoundsVolume]);
   const themePresetId = useClientSettings((s) => s.themePresetId);
   const themeOverrides = useClientSettings((s) => s.themeOverrides);
+  const { setTheme } = useTheme();
   useEffect(() => {
     applyPalette(themePresetId, themeOverrides);
+    // Keep the app's light/dark mode in sync with a themed preset so the terminal +
+    // file editor (which read resolvedTheme) follow it. Leave "default" untouched so a
+    // user's system/manual light-dark choice still stands.
+    if (themePresetId !== "default") {
+      setTheme(resolvePalettePreset(themePresetId).mode);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [themePresetId, themeOverrides]);
   const windowOpacity = useClientSettings((s) => s.windowOpacity);
   useEffect(() => {

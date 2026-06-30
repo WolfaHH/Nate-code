@@ -275,14 +275,13 @@ export const make = Effect.gen(function* () {
       // web surfaces via --surface-opacity. Other platforms keep the opaque chrome color.
       ...(environment.platform === "darwin"
         ? {
-            // `transparent: true` is required on macOS for the vibrancy material to
-            // actually composite — with it omitted the window stays opaque and the
-            // frost never shows (Electron #31862). Rounded corners + shadow still come
-            // from the vibrancy view.
+            // Raw window transparency: the desktop shows through wherever the web
+            // content is translucent (driven by --surface-opacity). The built-in
+            // `vibrancy` (frosted blur) is intentionally NOT used — it is unreliable on
+            // recent macOS and conflicts with `titleBarStyle: hiddenInset` (Electron
+            // #31862). A real frosted-glass blur needs a native addon (electron-liquid-glass).
             transparent: true,
             backgroundColor: "#00000000",
-            vibrancy: "under-window" as const,
-            visualEffectState: "active" as const,
           }
         : { backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors) }),
       ...iconOption,

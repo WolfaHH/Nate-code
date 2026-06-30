@@ -1003,6 +1003,7 @@ export function GeneralSettingsPanel() {
                 onClick={() => {
                   updateSettings({ themePresetId: "default", themeOverrides: {} });
                   applyPalette("default", {});
+                  setTheme("dark");
                 }}
               />
             ) : null
@@ -1012,8 +1013,12 @@ export function GeneralSettingsPanel() {
               value={settings.themePresetId}
               onValueChange={(id) => {
                 const presetId = id ?? "default";
+                const preset = PALETTE_PRESETS.find((p) => p.id === presetId);
                 updateSettings({ themePresetId: presetId });
                 applyPalette(presetId, settings.themeOverrides);
+                // Flip the app's light/dark mode to match the preset, so the terminal
+                // and file editor (which read resolvedTheme) follow the chosen theme.
+                if (preset) setTheme(preset.mode);
               }}
             >
               <SelectTrigger className="w-full sm:w-48" aria-label="Palette preset">
