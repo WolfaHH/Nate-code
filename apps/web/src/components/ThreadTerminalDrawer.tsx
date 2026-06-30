@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -15,11 +16,13 @@ import {
 import {
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
+  type TerminalLaunchCommand,
   type ThreadId,
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import {
+  type DragEvent as ReactDragEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type SetStateAction,
@@ -32,6 +35,7 @@ import {
 } from "react";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { cn } from "~/lib/utils";
+import { useClientSettings } from "~/hooks/useSettings";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import {
@@ -85,6 +89,32 @@ function writeSystemMessage(terminal: Terminal, message: string): void {
   terminal.write(`\r\n[terminal] ${message}\r\n`);
 }
 
+// The immersive terminal opens itself through `attach` (open-or-attach). The very
+// first attach can land before the session exists, which the server reports as
+// `TerminalSessionLookupError` ("Unknown terminal thread: …"). The atom re-subscribes
+// and the next attach opens cleanly, so the error is a transient lifecycle race, not
+// something the user can act on — don't paint a scary red line in the terminal for it.
+function isTransientTerminalLifecycleError(message: string): boolean {
+  return message.startsWith("Unknown terminal thread");
+}
+
+// Route every terminal error through here so a transient lifecycle race (typing
+// into a session that is being (re)attached, or that just exited) can never flood
+// the surface with red `[terminal] Unknown terminal thread` lines.
+function writeTerminalErrorMessage(terminal: Terminal, message: string): void {
+  if (isTransientTerminalLifecycleError(message)) return;
+  writeSystemMessage(terminal, message);
+}
+
+// Mirror how a real terminal inserts a dragged file path: backslash-escape the
+// shell-significant ASCII chars so a path with spaces reaches the running program
+// (claude's TUI auto-attaches dropped image paths). UTF-8 bytes are left intact so
+// accented filenames survive.
+function escapeDroppedPathForTerminal(path: string): string {
+  // eslint-disable-next-line no-useless-escape
+  return path.replace(/[\s'"`()\[\]{}<>|&;?*$!#=\\]/g, (char) => `\\${char}`);
+}
+
 function writeTerminalBuffer(terminal: Terminal, buffer: string): void {
   terminal.write("\u001bc");
   if (buffer.length > 0) {
@@ -123,7 +153,26 @@ function normalizeComputedColor(value: string | null | undefined, fallback: stri
   return value ?? fallback;
 }
 
-function terminalThemeFromApp(mountElement?: HTMLElement | null): ITheme {
+const DEFAULT_TERMINAL_FONT_FAMILY =
+  '"JetBrainsMono Nerd Font", "JetBrains Mono", "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace';
+
+function resolveTerminalFontFamily(value: string | undefined): string {
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_TERMINAL_FONT_FAMILY;
+}
+
+// Apply alpha to an rgb()/rgba() color so the terminal surface can be slightly
+// translucent (Ghostty-style). Requires `allowTransparency: true` on the Terminal.
+function applyTerminalAlpha(color: string, alpha: number): string {
+  if (alpha >= 1) return color;
+  const inner = color.match(/^rgba?\(([^)]+)\)$/i)?.[1];
+  if (!inner) return color;
+  const [r, g, b] = inner.split(",").map((part) => part.trim());
+  if (r === undefined || g === undefined || b === undefined) return color;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function terminalThemeFromApp(mountElement?: HTMLElement | null, backgroundOpacity = 1): ITheme {
   const isDark = document.documentElement.classList.contains("dark");
   const fallbackBackground = isDark ? "rgb(14, 18, 24)" : "rgb(255, 255, 255)";
   const fallbackForeground = isDark ? "rgb(237, 241, 247)" : "rgb(28, 33, 41)";
@@ -141,32 +190,42 @@ function terminalThemeFromApp(mountElement?: HTMLElement | null): ITheme {
     drawerStyles.color,
     normalizeComputedColor(bodyStyles.color, fallbackForeground),
   );
+  const bg = applyTerminalAlpha(background, backgroundOpacity);
 
   if (isDark) {
+    // Match Nate's Ghostty config exactly (~/.config/ghostty/config): muted grays
+    // with subtle accents, fg #b0b0b0, white bar cursor. Keeps the app-derived
+    // background blend + opacity so the surface still belongs to the app chrome.
     return {
-      background,
-      foreground,
-      cursor: "rgb(180, 203, 255)",
-      selectionBackground: "rgba(180, 203, 255, 0.25)",
-      scrollbarSliderBackground: "rgba(255, 255, 255, 0.1)",
-      scrollbarSliderHoverBackground: "rgba(255, 255, 255, 0.18)",
-      scrollbarSliderActiveBackground: "rgba(255, 255, 255, 0.22)",
-      black: "rgb(24, 30, 38)",
-      red: "rgb(255, 122, 142)",
-      green: "rgb(134, 231, 149)",
-      yellow: "rgb(244, 205, 114)",
-      blue: "rgb(137, 190, 255)",
-      magenta: "rgb(208, 176, 255)",
-      cyan: "rgb(124, 232, 237)",
-      white: "rgb(210, 218, 230)",
-      brightBlack: "rgb(110, 120, 136)",
-      brightRed: "rgb(255, 168, 180)",
-      brightGreen: "rgb(176, 245, 186)",
-      brightYellow: "rgb(255, 224, 149)",
-      brightBlue: "rgb(174, 210, 255)",
-      brightMagenta: "rgb(229, 203, 255)",
-      brightCyan: "rgb(167, 244, 247)",
-      brightWhite: "rgb(244, 247, 252)",
+      background: applyTerminalAlpha("rgb(5, 5, 5)", backgroundOpacity),
+      // Brighter than raw Ghostty (#b0b0b0): with an opaque surface the text should
+      // read crisp white, and the accents punchier — the muted Ghostty values looked
+      // washed out behind xterm's transparency rendering.
+      foreground: "rgb(228, 228, 228)",
+      cursor: "rgb(255, 255, 255)",
+      cursorAccent: "rgb(5, 5, 5)",
+      selectionBackground: "rgba(90, 90, 90, 0.9)",
+      selectionForeground: "rgb(255, 255, 255)",
+      selectionInactiveBackground: "rgba(90, 90, 90, 0.5)",
+      scrollbarSliderBackground: "rgba(255, 255, 255, 0.12)",
+      scrollbarSliderHoverBackground: "rgba(255, 255, 255, 0.2)",
+      scrollbarSliderActiveBackground: "rgba(255, 255, 255, 0.26)",
+      black: "rgb(30, 30, 30)",
+      red: "rgb(234, 112, 112)",
+      green: "rgb(128, 198, 128)",
+      yellow: "rgb(234, 196, 130)",
+      blue: "rgb(124, 166, 220)",
+      magenta: "rgb(180, 142, 204)",
+      cyan: "rgb(122, 202, 202)",
+      white: "rgb(206, 206, 206)",
+      brightBlack: "rgb(102, 102, 102)",
+      brightRed: "rgb(255, 142, 142)",
+      brightGreen: "rgb(154, 226, 154)",
+      brightYellow: "rgb(255, 222, 154)",
+      brightBlue: "rgb(154, 194, 248)",
+      brightMagenta: "rgb(206, 166, 232)",
+      brightCyan: "rgb(154, 228, 228)",
+      brightWhite: "rgb(244, 244, 244)",
     };
   }
 
@@ -178,22 +237,22 @@ function terminalThemeFromApp(mountElement?: HTMLElement | null): ITheme {
     scrollbarSliderBackground: "rgba(0, 0, 0, 0.15)",
     scrollbarSliderHoverBackground: "rgba(0, 0, 0, 0.25)",
     scrollbarSliderActiveBackground: "rgba(0, 0, 0, 0.3)",
-    black: "rgb(44, 53, 66)",
-    red: "rgb(191, 70, 87)",
-    green: "rgb(60, 126, 86)",
-    yellow: "rgb(146, 112, 35)",
-    blue: "rgb(72, 102, 163)",
-    magenta: "rgb(132, 86, 149)",
-    cyan: "rgb(53, 127, 141)",
-    white: "rgb(210, 215, 223)",
-    brightBlack: "rgb(112, 123, 140)",
-    brightRed: "rgb(212, 95, 112)",
-    brightGreen: "rgb(85, 148, 111)",
-    brightYellow: "rgb(173, 133, 45)",
-    brightBlue: "rgb(91, 124, 194)",
-    brightMagenta: "rgb(153, 107, 172)",
-    brightCyan: "rgb(70, 149, 164)",
-    brightWhite: "rgb(236, 240, 246)",
+    black: "rgb(40, 48, 60)",
+    red: "rgb(214, 52, 70)",
+    green: "rgb(34, 142, 84)",
+    yellow: "rgb(176, 120, 12)",
+    blue: "rgb(38, 100, 204)",
+    magenta: "rgb(151, 64, 178)",
+    cyan: "rgb(20, 140, 158)",
+    white: "rgb(204, 210, 220)",
+    brightBlack: "rgb(104, 116, 134)",
+    brightRed: "rgb(232, 74, 92)",
+    brightGreen: "rgb(48, 162, 100)",
+    brightYellow: "rgb(196, 138, 24)",
+    brightBlue: "rgb(58, 120, 224)",
+    brightMagenta: "rgb(172, 84, 198)",
+    brightCyan: "rgb(36, 160, 178)",
+    brightWhite: "rgb(244, 247, 252)",
   };
 }
 
@@ -276,6 +335,8 @@ interface TerminalViewportProps {
   cwd: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
+  /** Immersive mode: run this command (e.g. `claude --resume <id>`) as the PTY root. */
+  launchCommand?: TerminalLaunchCommand;
   onSessionExited: () => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   focusRequestId: number;
@@ -299,6 +360,7 @@ export function TerminalViewport({
   cwd,
   worktreePath,
   runtimeEnv,
+  launchCommand,
   onSessionExited,
   onAddTerminalContext,
   focusRequestId,
@@ -310,6 +372,7 @@ export function TerminalViewport({
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const frameRef = useRef<number | null>(null);
   const environmentId = threadRef.environmentId;
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const openInPreferredEditor = useOpenInPreferredEditor(
@@ -333,6 +396,21 @@ export function TerminalViewport({
   const selectionActionOpenRef = useRef(false);
   const selectionActionTimerRef = useRef<number | null>(null);
   const keybindingsRef = useRef(keybindings);
+  const terminalFontFamily = useClientSettings((s) => s.terminalFontFamily);
+  const terminalFontSize = useClientSettings((s) => s.terminalFontSize);
+  const terminalBackgroundOpacity = useClientSettings((s) => s.terminalBackgroundOpacity);
+  // Mirror appearance into a ref so the (once-on-mount) construction effect and
+  // the theme MutationObserver read current values without re-creating the term.
+  const appearanceRef = useRef({
+    fontFamily: terminalFontFamily,
+    fontSize: terminalFontSize,
+    bgOpacity: terminalBackgroundOpacity,
+  });
+  appearanceRef.current = {
+    fontFamily: terminalFontFamily,
+    fontSize: terminalFontSize,
+    bgOpacity: terminalBackgroundOpacity,
+  };
   const runtimeEnvKey = useMemo(() => runtimeEnvSignature(runtimeEnv), [runtimeEnv]);
   const handleSessionExited = useEffectEvent(() => {
     onSessionExited();
@@ -349,6 +427,7 @@ export function TerminalViewport({
       cwd,
       ...(worktreePath !== undefined ? { worktreePath } : {}),
       ...(runtimeEnv ? { env: runtimeEnv } : {}),
+      ...(launchCommand ? { launchCommand } : {}),
     },
   });
   const writeTerminal = useEffectEvent((data: string) =>
@@ -357,6 +436,29 @@ export function TerminalViewport({
       input: { threadId, terminalId, data },
     }),
   );
+  const handleTerminalDragOver = useEffectEvent((event: ReactDragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  // Drop a file onto the terminal → insert its escaped OS path (like VS Code / iTerm).
+  // The PTY runs locally on the desktop, so the desktop bridge's OS path is the path
+  // claude needs to attach the image. No path (browser / remote env) → no-op.
+  const handleTerminalDrop = useEffectEvent((event: ReactDragEvent<HTMLDivElement>) => {
+    const files = event.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    event.preventDefault();
+    const getPath = typeof window !== "undefined" ? window.desktopBridge?.getPathForFile : undefined;
+    if (!getPath) return;
+    const paths: string[] = [];
+    for (const file of Array.from(files)) {
+      const path = getPath(file).trim();
+      if (path.length > 0) paths.push(escapeDroppedPathForTerminal(path));
+    }
+    if (paths.length === 0) return;
+    terminalRef.current?.focus();
+    void writeTerminal(`${paths.join(" ")} `);
+  });
   const resizeTerminal = useEffectEvent((cols: number, rows: number) =>
     runTerminalResize({
       environmentId,
@@ -378,6 +480,21 @@ export function TerminalViewport({
     keybindingsRef.current = keybindings;
   }, [keybindings]);
 
+  // Apply terminal font/size/background-opacity changes to the live terminal.
+  useEffect(() => {
+    const activeTerminal = terminalRef.current;
+    if (!activeTerminal) return;
+    activeTerminal.options.fontFamily = resolveTerminalFontFamily(terminalFontFamily);
+    activeTerminal.options.fontSize = terminalFontSize;
+    activeTerminal.options.theme = terminalThemeFromApp(
+      containerRef.current,
+      terminalBackgroundOpacity < 90 ? terminalBackgroundOpacity / 100 : 1,
+    );
+    const activeFitAddon = fitAddonRef.current;
+    if (activeFitAddon) fitTerminalSafely(activeFitAddon);
+    activeTerminal.refresh(0, activeTerminal.rows - 1);
+  }, [terminalFontFamily, terminalFontSize, terminalBackgroundOpacity]);
+
   useEffect(() => {
     const mount = containerRef.current;
     if (!mount) return;
@@ -385,17 +502,45 @@ export function TerminalViewport({
     const localApi = readLocalApi();
 
     const fitAddon = new FitAddon();
+    const appearance = appearanceRef.current;
     const terminal = new Terminal({
-      cursorBlink: true,
+      // Match Nate's Ghostty: steady bar caret (cursor-style = bar, no blink).
+      // `lineHeight` stays at 1 so claude's box-drawing TUI borders stay connected.
+      cursorBlink: false,
+      cursorStyle: "bar",
+      cursorInactiveStyle: "bar",
       lineHeight: 1,
-      fontSize: 12,
-      scrollback: 5_000,
-      fontFamily:
-        '"SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace',
-      theme: terminalThemeFromApp(mount),
+      letterSpacing: 0,
+      fontSize: appearance.fontSize,
+      fontWeight: "400",
+      fontWeightBold: "600",
+      // Instant scroll (Ghostty-style snappiness). A non-zero smooth duration adds an
+      // easing animation to every wheel notch, which reads as laggy/molasses, not fluid.
+      smoothScrollDuration: 0,
+      scrollback: 10_000,
+      fontFamily: resolveTerminalFontFamily(appearance.fontFamily),
+      // Only pay the transparency rendering path (grayscale AA, which washes the text
+      // out — the "filtre assombrissant") when the background is MEANINGFULLY
+      // translucent. Near-opaque (>=90%) renders as a crisp opaque surface: a few
+      // percent of see-through isn't worth softening every glyph.
+      allowTransparency: appearance.bgOpacity < 90,
+      theme: terminalThemeFromApp(mount, appearance.bgOpacity < 90 ? appearance.bgOpacity / 100 : 1),
     });
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
+    // GPU renderer (the one VS Code's terminal uses). The default DOM renderer paints
+    // every glyph as a CSS <span>, which on a dark surface reads thin and washed-out
+    // ("terne / pas assez blanc / ECO+"); WebGL rasterizes glyphs with full-pixel
+    // coverage so text lands crisp and punchy. Best-effort: if WebGL is unavailable or
+    // its context is lost (many terminals can exhaust GPU contexts), dispose the addon
+    // and xterm transparently falls back to the DOM renderer -- never worse than before.
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      terminal.loadAddon(webgl);
+    } catch (error) {
+      console.warn("[terminal] WebGL renderer unavailable, falling back to DOM", error);
+    }
     fitTerminalSafely(fitAddon);
 
     terminalRef.current = terminal;
@@ -492,9 +637,37 @@ export function TerminalViewport({
       const result = await writeTerminal(data);
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        writeSystemMessage(activeTerminal, error instanceof Error ? error.message : fallbackError);
+        writeTerminalErrorMessage(
+          activeTerminal,
+          error instanceof Error ? error.message : fallbackError,
+        );
       }
     };
+
+    // claude's TUI turns on mouse tracking, which makes xterm forward the wheel to
+    // the program instead of scrolling its own scrollback. The result is the user
+    // gets stuck after scrolling up — "feels like vim, can't get back down". Real
+    // terminals (Ghostty, VS Code) keep scrolling the scrollback in the normal
+    // buffer regardless of mouse mode, so do the same: when a program has grabbed
+    // the mouse, scroll the scrollback ourselves and don't forward the wheel.
+    terminal.attachCustomWheelEventHandler((event) => {
+      const active = terminalRef.current;
+      if (!active) return true;
+      // In a full-screen TUI (alt buffer) the program owns scrolling — let it through.
+      // In the normal buffer ALWAYS scroll our own scrollback (never forward the wheel
+      // to the program), so the user can never get stuck after scrolling up no matter
+      // whether claude has grabbed the mouse.
+      if (active.buffer.active.type !== "normal") {
+        return true;
+      }
+      // deltaMode 1 = lines, 0 = pixels (≈ one cell per ~20px on a trackpad). Multiply
+      // so each wheel notch travels further — the default felt sluggish next to Ghostty.
+      const SCROLL_SPEED = 3;
+      const rawLines = event.deltaMode === 1 ? event.deltaY : event.deltaY / 20;
+      const lines = Math.trunc(rawLines * SCROLL_SPEED);
+      active.scrollLines(lines !== 0 ? lines : Math.sign(event.deltaY));
+      return false;
+    });
 
     terminal.attachCustomKeyEventHandler((event) => {
       const currentKeybindings = keybindingsRef.current;
@@ -624,7 +797,7 @@ export function TerminalViewport({
           return;
         }
         const error = squashAtomCommandFailure(result);
-        writeSystemMessage(
+        writeTerminalErrorMessage(
           terminal,
           error instanceof Error ? error.message : "Terminal write failed",
         );
@@ -666,7 +839,10 @@ export function TerminalViewport({
     const themeObserver = new MutationObserver(() => {
       const activeTerminal = terminalRef.current;
       if (!activeTerminal) return;
-      activeTerminal.options.theme = terminalThemeFromApp(containerRef.current);
+      activeTerminal.options.theme = terminalThemeFromApp(
+        containerRef.current,
+        appearanceRef.current.bgOpacity < 90 ? appearanceRef.current.bgOpacity / 100 : 1,
+      );
       activeTerminal.refresh(0, activeTerminal.rows - 1);
     });
     themeObserver.observe(document.documentElement, {
@@ -729,14 +905,19 @@ export function TerminalViewport({
       current.buffer.length >= previous.buffer.length &&
       current.buffer.startsWith(previous.buffer)
     ) {
+      // Incremental append: existing rows keep their absolute buffer coordinates, so an
+      // ongoing mouse selection stays valid. Do NOT clear it — clearing on every chunk of
+      // streamed output is what made selecting impossible while claude keeps printing.
       terminal.write(current.buffer.slice(previous.buffer.length));
     } else {
+      // Full rewrite (reset + replay): the old selection coordinates no longer map to
+      // anything, so drop it.
       writeTerminalBuffer(terminal, current.buffer);
+      terminal.clearSelection();
     }
-    terminal.clearSelection();
 
     if (current.error !== null && current.error !== previous.error) {
-      writeSystemMessage(terminal, current.error);
+      writeTerminalErrorMessage(terminal, current.error);
     }
 
     if (current.status === "running") {
@@ -782,23 +963,84 @@ export function TerminalViewport({
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
     if (!terminal || !fitAddon) return;
-    const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
-    const frame = window.requestAnimationFrame(() => {
-      fitTerminalSafely(fitAddon);
-      if (wasAtBottom) {
-        terminal.scrollToBottom();
-      }
+    // Fit across a few frames + a short delay: when the terminal mounts while a side
+    // panel is already open (or the panel just toggled), the flex layout settles over
+    // several frames, so a single fit can lock in a wrong (too-narrow / shifted) size.
+    const refit = () => {
+      const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+      if (!fitTerminalSafely(fitAddon)) return;
+      if (wasAtBottom) terminal.scrollToBottom();
       void resizeTerminal(terminal.cols, terminal.rows);
+    };
+    const frame1 = window.requestAnimationFrame(() => {
+      refit();
+      const frame2 = window.requestAnimationFrame(refit);
+      frameRef.current = frame2;
     });
+    const timer = window.setTimeout(refit, 120);
     return () => {
-      window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(frame1);
+      if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current);
+      window.clearTimeout(timer);
     };
   }, [drawerHeight, environmentId, resizeEpoch, terminalId, threadId]);
+
+  // Re-fit whenever the container itself resizes (side panel open/close, window resize,
+  // full-pane immersive mode) — not just when the parent bumps `resizeEpoch`.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return;
+    // Defend against a resize feedback loop (the "scroll a lot → it re-renders ultra
+    // fast, scrolling dies, the mouse selection can't survive >1s" freeze): fit() can
+    // change the column count → content reflows → the 6px scrollbar toggles → the
+    // measured width shifts by ~6px → the observer fires → fit() again, forever. Each
+    // resize() also clears the selection, so the loop makes selecting impossible. Two
+    // guards: (1) ignore sub-cell width/height deltas (< 8px) so scrollbar jitter can't
+    // drive a re-fit, (2) coalesce surviving observations to one fit per frame.
+    let frame: number | null = null;
+    let lastWidth = container.clientWidth;
+    let lastHeight = container.clientHeight;
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[entries.length - 1]?.contentRect;
+      if (rect) {
+        if (Math.abs(rect.width - lastWidth) < 8 && Math.abs(rect.height - lastHeight) < 8) {
+          return;
+        }
+        lastWidth = rect.width;
+        lastHeight = rect.height;
+      }
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        const terminal = terminalRef.current;
+        const fitAddon = fitAddonRef.current;
+        if (!terminal || !fitAddon) return;
+        const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+        if (!fitTerminalSafely(fitAddon)) return;
+        if (wasAtBottom) terminal.scrollToBottom();
+        void resizeTerminal(terminal.cols, terminal.rows);
+      });
+    });
+    observer.observe(container);
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+    // `resizeTerminal` is a stable useEffectEvent; the container is stable for the mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [environmentId, terminalId, threadId]);
   return (
-    <div
-      ref={containerRef}
-      className="relative h-full w-full overflow-hidden rounded-[4px] bg-background"
-    />
+    // Outer frame owns the padding + rounded background so the xterm content gets a
+    // little breathing room from the edge (Ghostty-style window padding) without the
+    // FitAddon (which measures the mount node) miscounting columns.
+    <div className="thread-terminal-drawer relative h-full w-full overflow-hidden rounded-[6px] bg-background p-1.5">
+      <div
+        ref={containerRef}
+        onDragOver={handleTerminalDragOver}
+        onDrop={handleTerminalDrop}
+        className="h-full w-full"
+      />
+    </div>
   );
 }
 

@@ -11,6 +11,12 @@
     <meta name="theme-color" content="#161616" />
     <link rel="icon" href="/favicon.ico" sizes="48x48" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,100..900;1,100..900&display=swap"
+      rel="stylesheet"
+    />
     <script>
       (() => {
         const LIGHT_BACKGROUND = "#ffffff";
@@ -48,8 +54,8 @@
         background: #ffffff;
         color: #262626;
         font-family:
+          "Hanken Grotesk",
           "DM Sans Variable",
-          "DM Sans",
           -apple-system,
           BlinkMacSystemFont,
           "Segoe UI",
@@ -58,7 +64,10 @@
       }
 
       html.dark body {
-        background: #161616;
+        /* Transparent base: the single translucent layer is --background / --sidebar on
+           the panels above, so the macOS vibrancy backdrop shows through without the
+           body adding a second stacked layer (which would push opacity back to ~100%). */
+        background: transparent;
         color: #f5f5f5;
       }
 
@@ -84,13 +93,13 @@
         object-fit: contain;
       }
     </style>
-    <title>T3 Code (Alpha)</title>
+    <title>NateCode (Alpha)</title>
   </head>
   <body>
     <div id="root">
       <div id="boot-shell">
-        <div id="boot-shell-card" aria-label="T3 Code splash screen">
-          <img id="boot-shell-logo" src="/apple-touch-icon.png" alt="T3 Code" />
+        <div id="boot-shell-card" aria-label="NateCode splash screen">
+          <img id="boot-shell-logo" src="/apple-touch-icon.png" alt="NateCode" />
         </div>
       </div>
     </div>

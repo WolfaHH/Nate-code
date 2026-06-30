@@ -7,7 +7,9 @@ import {
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { memo } from "react";
+import { MessageSquareIcon, TerminalIcon } from "lucide-react";
 import GitActionsControl from "../GitActionsControl";
+import { useThreadViewModeStore } from "~/threadViewModeStore";
 import { type DraftId } from "~/composerDraftStore";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import ProjectScriptsControl, {
@@ -15,6 +17,7 @@ import ProjectScriptsControl, {
   type ProjectScriptActionResult,
 } from "../ProjectScriptsControl";
 import { OpenInPicker } from "./OpenInPicker";
+import { Button } from "../ui/button";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { cn } from "~/lib/utils";
 
@@ -76,6 +79,8 @@ export const ChatHeader = memo(function ChatHeader({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
   });
+  const viewMode = useThreadViewModeStore((s) => s.mode);
+  const isTerminalMode = viewMode === "terminal";
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
       <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden sm:gap-3">
@@ -119,6 +124,31 @@ export const ChatHeader = memo(function ChatHeader({
             openInCwd={openInCwd}
           />
         )}
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                aria-label={isTerminalMode ? "Back to chat" : "Open terminal mode"}
+                size="icon-xs"
+                variant="outline"
+                onClick={() =>
+                  useThreadViewModeStore
+                    .getState()
+                    .setMode(isTerminalMode ? "gui" : "terminal")
+                }
+              />
+            }
+          >
+            {isTerminalMode ? (
+              <MessageSquareIcon aria-hidden="true" className="size-3.5" />
+            ) : (
+              <TerminalIcon aria-hidden="true" className="size-3.5" />
+            )}
+          </TooltipTrigger>
+          <TooltipPopup side="top">
+            {isTerminalMode ? "Back to chat" : "Open terminal mode"}
+          </TooltipPopup>
+        </Tooltip>
         {activeProjectName && (
           <GitActionsControl
             gitCwd={gitCwd}

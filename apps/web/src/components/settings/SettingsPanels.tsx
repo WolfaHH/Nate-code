@@ -37,6 +37,8 @@ import { TraitsPicker } from "../chat/TraitsPicker";
 import { isElectron } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
 import { useTheme } from "../../hooks/useTheme";
+import { applyPalette, EDITABLE_PALETTE_TOKENS, PALETTE_PRESETS } from "../../theme/palette";
+import { useThreadViewModeStore } from "~/threadViewModeStore";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
@@ -480,6 +482,7 @@ export function GeneralSettingsPanel() {
   const { theme, setTheme } = useTheme();
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
+  const defaultThreadView = useThreadViewModeStore((s) => s.mode);
   const observability = useAtomValue(primaryServerObservabilityAtom);
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
   const diagnosticsDescription = formatDiagnosticsDescription({
@@ -518,7 +521,7 @@ export function GeneralSettingsPanel() {
       <SettingsSection title="General">
         <SettingsRow
           title="Theme"
-          description="Choose how T3 Code looks across the app."
+          description="Choose how NateCode looks across the app."
           resetAction={
             theme !== "system" ? (
               <SettingResetButton label="theme" onClick={() => setTheme("system")} />
@@ -665,6 +668,42 @@ export function GeneralSettingsPanel() {
               }
               aria-label="Stream assistant messages"
             />
+          }
+        />
+
+        <SettingsRow
+          title="Notification sounds"
+          description="Volume of the chime when an agent finishes or needs you. Set to 0 to mute."
+          resetAction={
+            settings.agentSoundsVolume !== DEFAULT_UNIFIED_SETTINGS.agentSoundsVolume ? (
+              <SettingResetButton
+                label="notification sound volume"
+                onClick={() =>
+                  updateSettings({
+                    agentSoundsVolume: DEFAULT_UNIFIED_SETTINGS.agentSoundsVolume,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex w-full items-center gap-2 sm:w-44">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={settings.agentSoundsVolume}
+                onChange={(event) =>
+                  updateSettings({ agentSoundsVolume: Number(event.target.value) })
+                }
+                className="h-1 flex-1 cursor-pointer accent-primary"
+                aria-label="Notification sound volume"
+              />
+              <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {settings.agentSoundsVolume}%
+              </span>
+            </div>
           }
         />
 
@@ -947,6 +986,203 @@ export function GeneralSettingsPanel() {
                   });
                 }}
               />
+            </div>
+          }
+        />
+      </SettingsSection>
+
+      <SettingsSection title="Color palette">
+        <SettingsRow
+          title="Preset"
+          description="Default keeps the shipped colors. Default 2 (Midnight) is a near-black dark look."
+          resetAction={
+            settings.themePresetId !== "default" ||
+            Object.keys(settings.themeOverrides).length > 0 ? (
+              <SettingResetButton
+                label="palette"
+                onClick={() => {
+                  updateSettings({ themePresetId: "default", themeOverrides: {} });
+                  applyPalette("default", {});
+                }}
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.themePresetId}
+              onValueChange={(id) => {
+                const presetId = id ?? "default";
+                updateSettings({ themePresetId: presetId });
+                applyPalette(presetId, settings.themeOverrides);
+              }}
+            >
+              <SelectTrigger className="w-full sm:w-48" aria-label="Palette preset">
+                <SelectValue>
+                  {PALETTE_PRESETS.find((preset) => preset.id === settings.themePresetId)?.label ??
+                    "Default"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                {PALETTE_PRESETS.map((preset) => (
+                  <SelectItem hideIndicator key={preset.id} value={preset.id}>
+                    {preset.label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          }
+        />
+        <div className="flex flex-col gap-2 px-1 pb-1">
+          <span className="text-[11px] text-muted-foreground/60">
+            Override individual tokens with any CSS color (hex, oklch, …). Leave empty to use the
+            preset/default. Applies live.
+          </span>
+          <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+            {EDITABLE_PALETTE_TOKENS.map((token) => (
+              <label key={token.cssVar} className="flex items-center gap-2 text-[11px]">
+                <span className="w-24 shrink-0 text-muted-foreground">{token.label}</span>
+                <DraftInput
+                  className="h-7 flex-1 font-mono text-[11px]"
+                  value={settings.themeOverrides[token.cssVar] ?? ""}
+                  onCommit={(next) => {
+                    const overrides: Record<string, string> = { ...settings.themeOverrides };
+                    const value = next.trim();
+                    if (value.length > 0) overrides[token.cssVar] = value;
+                    else delete overrides[token.cssVar];
+                    updateSettings({ themeOverrides: overrides });
+                    applyPalette(settings.themePresetId, overrides);
+                  }}
+                  placeholder="(default)"
+                  spellCheck={false}
+                  aria-label={`${token.label} color value`}
+                />
+              </label>
+            ))}
+          </div>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection title="Terminal & window">
+        <SettingsRow
+          title="Default view"
+          description="Open threads in the structured Chat or the immersive Terminal (real Claude Code CLI). Applies to every thread."
+          control={
+            <Select
+              value={defaultThreadView}
+              onValueChange={(v) =>
+                useThreadViewModeStore.getState().setMode(v === "terminal" ? "terminal" : "gui")
+              }
+            >
+              <SelectTrigger className="w-full sm:w-44" aria-label="Default thread view">
+                <SelectValue>{defaultThreadView === "terminal" ? "Terminal" : "Chat"}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem hideIndicator value="gui">
+                  Chat
+                </SelectItem>
+                <SelectItem hideIndicator value="terminal">
+                  Terminal
+                </SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
+        <SettingsRow
+          title="Window opacity"
+          description="Very slightly reduce to let other desktop apps show through (Ghostty-style)."
+          resetAction={
+            settings.windowOpacity !== DEFAULT_UNIFIED_SETTINGS.windowOpacity ? (
+              <SettingResetButton
+                label="window opacity"
+                onClick={() => updateSettings({ windowOpacity: DEFAULT_UNIFIED_SETTINGS.windowOpacity })}
+              />
+            ) : null
+          }
+          control={
+            <div className="flex w-full items-center gap-2 sm:w-44">
+              <input
+                type="range"
+                min={60}
+                max={100}
+                step={1}
+                value={settings.windowOpacity}
+                onChange={(event) =>
+                  updateSettings({ windowOpacity: Number(event.target.value) })
+                }
+                className="h-1 flex-1 cursor-pointer accent-primary"
+                aria-label="Window opacity"
+              />
+              <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {settings.windowOpacity}%
+              </span>
+            </div>
+          }
+        />
+        <SettingsRow
+          title="Terminal font"
+          description="Font family for the integrated terminal. Empty = bundled default."
+          resetAction={
+            settings.terminalFontFamily !== "" ? (
+              <SettingResetButton
+                label="terminal font"
+                onClick={() => updateSettings({ terminalFontFamily: "" })}
+              />
+            ) : null
+          }
+          control={
+            <DraftInput
+              className="w-full font-mono text-[11px] sm:w-56"
+              value={settings.terminalFontFamily}
+              onCommit={(next) => updateSettings({ terminalFontFamily: next })}
+              placeholder="JetBrains Mono, SF Mono, …"
+              spellCheck={false}
+              aria-label="Terminal font family"
+            />
+          }
+        />
+        <SettingsRow
+          title="Terminal font size"
+          description="Font size (px) for the integrated terminal."
+          control={
+            <div className="flex w-full items-center gap-2 sm:w-44">
+              <input
+                type="range"
+                min={8}
+                max={24}
+                step={1}
+                value={settings.terminalFontSize}
+                onChange={(event) =>
+                  updateSettings({ terminalFontSize: Number(event.target.value) })
+                }
+                className="h-1 flex-1 cursor-pointer accent-primary"
+                aria-label="Terminal font size"
+              />
+              <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {settings.terminalFontSize}px
+              </span>
+            </div>
+          }
+        />
+        <SettingsRow
+          title="Terminal background opacity"
+          description="Slight translucency over the app behind the terminal."
+          control={
+            <div className="flex w-full items-center gap-2 sm:w-44">
+              <input
+                type="range"
+                min={50}
+                max={100}
+                step={1}
+                value={settings.terminalBackgroundOpacity}
+                onChange={(event) =>
+                  updateSettings({ terminalBackgroundOpacity: Number(event.target.value) })
+                }
+                className="h-1 flex-1 cursor-pointer accent-primary"
+                aria-label="Terminal background opacity"
+              />
+              <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                {settings.terminalBackgroundOpacity}%
+              </span>
             </div>
           }
         />

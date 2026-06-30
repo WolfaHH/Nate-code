@@ -20,6 +20,7 @@ import {
   ProviderDriverKind,
   RuntimeMode,
   TerminalOpenInput,
+  type TerminalLaunchCommand,
 } from "@t3tools/contracts";
 import {
   connectionStatusText,
@@ -34,6 +35,7 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   createModelSelection,
+  getModelSelectionStringOptionValue,
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
 import { CHAT_LIST_ANCHOR_OFFSET } from "@t3tools/shared/chatList";
@@ -135,8 +137,10 @@ import { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
 import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
-import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
-import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
+import ThreadTerminalDrawer, { TerminalViewport } from "./ThreadTerminalDrawer";
+import { Spinner } from "./ui/spinner";
+import { useThreadViewModeStore } from "~/threadViewModeStore";
+import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon, XIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -164,6 +168,8 @@ import {
   useComposerDraftStore,
   type DraftId,
 } from "../composerDraftStore";
+import { EMPTY_QUEUE, useMessageQueueStore } from "../messageQueueStore";
+import { parseGoalCommand, useGoalStore } from "../goalStore";
 import {
   appendTerminalContextsToPrompt,
   formatTerminalContextLabel,
@@ -188,7 +194,7 @@ import {
   serverEnvironment,
 } from "../state/server";
 import { terminalEnvironment } from "../state/terminal";
-import { threadEnvironment } from "../state/threads";
+import { environmentThreads, threadEnvironment } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
@@ -236,6 +242,7 @@ import {
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { previewEnvironment } from "../state/preview";
@@ -251,6 +258,7 @@ import { useAssetUrls } from "../assets/assetUrls";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
+const AGENT_CLAUDE_TERMINAL_ID = "agent-claude";
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
@@ -999,6 +1007,12 @@ function ChatViewContent(props: ChatViewProps) {
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
+  const fetchThreadResumeInfo = useAtomCommand(terminalEnvironment.resumeInfo, {
+    reportFailure: false,
+  });
+  const syncTerminalTranscript = useAtomCommand(terminalEnvironment.syncTranscript, {
+    reportFailure: false,
+  });
   const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
@@ -1285,6 +1299,129 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThread],
   );
   const activeThreadKey = activeThreadRef ? scopedThreadKey(activeThreadRef) : null;
+  const threadViewModeValue = useThreadViewModeStore((s) => s.mode);
+  const [terminalResumeInfo, setTerminalResumeInfo] = useState<{
+    readonly isClaude: boolean;
+    readonly sessionId: string | null;
+    readonly binaryPath: string;
+    readonly homeOverride: string | null;
+  } | null>(null);
+  // Guards the resume-info fetch so it runs once per terminal-mode entry, not every render.
+  const terminalEnterGuardRef = useRef<string | null>(null);
+  // The thread whose immersive `claude` PTY is currently live, so we can kill it when
+  // leaving terminal mode — single-writer: the GUI SDK must become the sole writer of
+  // the session transcript again before it can resume.
+  const terminalActiveRefRef = useRef<ScopedThreadRef | null>(null);
+  useEffect(() => {
+    if (threadViewModeValue !== "terminal" || !activeThreadRef || !activeThreadId) {
+      // Left terminal mode (or no active thread): kill the PTY `claude` so the GUI SDK is
+      // the sole writer of the session `.jsonl` again, then clear state so a later re-enter
+      // re-fetches resume info and respawns a fresh `claude --resume`.
+      const closingRef = terminalActiveRefRef.current;
+      if (closingRef) {
+        terminalActiveRefRef.current = null;
+        void (async () => {
+          // Kill the PTY `claude` first so it's no longer writing the session `.jsonl`,
+          // then import the terminal-written tail into the GUI projection so the chat
+          // reflects the turns driven from the TUI (Terminal → GUI sync, Phase 2).
+          await closeTerminalMutation({
+            environmentId: closingRef.environmentId,
+            input: {
+              threadId: closingRef.threadId,
+              terminalId: AGENT_CLAUDE_TERMINAL_ID,
+              deleteHistory: true,
+            },
+          }).catch(() => undefined);
+          const syncResult = await syncTerminalTranscript({
+            environmentId: closingRef.environmentId,
+            input: { threadId: closingRef.threadId },
+          }).catch(() => undefined);
+          // The importer writes terminal turns straight to the projection (not through
+          // the orchestration event pipeline), so the live thread subscription never
+          // sees them. Force a re-snapshot of the thread-state atom so the GUI chat
+          // shows the terminal-driven turns immediately on switch-back, not only after
+          // the thread is reopened. Only when something was actually imported.
+          const importedTurns =
+            syncResult && syncResult._tag === "Success" ? syncResult.value.imported : 0;
+          if (importedTurns > 0) {
+            appAtomRegistry.refresh(
+              environmentThreads.stateAtom(closingRef.environmentId, closingRef.threadId),
+            );
+          }
+        })();
+      }
+      terminalEnterGuardRef.current = null;
+      setTerminalResumeInfo(null);
+      return;
+    }
+    if (!activeThreadKey) return;
+    if (terminalEnterGuardRef.current === activeThreadKey) return;
+    const enterKey = activeThreadKey;
+    terminalEnterGuardRef.current = enterKey;
+    const enterThreadRef = activeThreadRef;
+    const enterThreadId = activeThreadId;
+    const enterThread = activeThread;
+    void (async () => {
+      // Interrupt any in-flight GUI turn before handing the session to the TUI (best-effort).
+      if (enterThread) {
+        await interruptThreadTurn({
+          environmentId: enterThreadRef.environmentId,
+          input: buildThreadTurnInterruptInput(enterThread),
+        }).catch(() => undefined);
+      }
+      const result = await fetchThreadResumeInfo({
+        environmentId: enterThreadRef.environmentId,
+        input: { threadId: enterThreadId },
+      });
+      // Apply only if we're STILL entered for this same thread (leaving clears the guard).
+      // Keyed on the guard ref — not a per-render `cancelled` flag — so the frequent
+      // re-renders an active thread triggers no longer abort the in-flight fetch.
+      if (terminalEnterGuardRef.current !== enterKey) return;
+      if (result._tag !== "Success" || !result.value.isClaude) {
+        // Not a Claude session — or a brand-new thread with no session yet (nothing to
+        // share/resume). Drop back to the GUI instead of spinning on the loader forever.
+        useThreadViewModeStore.getState().setMode("gui");
+        return;
+      }
+      // Start from a clean slate: drop any stale agent-terminal session/history for this
+      // thread (e.g. left over from a previous app run killed before it could clean up).
+      // Otherwise the persisted buffer — including old transient errors — gets replayed on
+      // open. Best-effort: closing a non-existent session just no-ops. claude redraws via --resume.
+      await closeTerminalMutation({
+        environmentId: enterThreadRef.environmentId,
+        input: {
+          threadId: enterThreadRef.threadId,
+          terminalId: AGENT_CLAUDE_TERMINAL_ID,
+          deleteHistory: true,
+        },
+      }).catch(() => undefined);
+      if (terminalEnterGuardRef.current !== enterKey) return;
+      terminalActiveRefRef.current = enterThreadRef;
+      setTerminalResumeInfo(result.value);
+    })();
+  }, [
+    threadViewModeValue,
+    activeThreadKey,
+    activeThreadRef,
+    activeThreadId,
+    activeThread,
+    interruptThreadTurn,
+    fetchThreadResumeInfo,
+    closeTerminalMutation,
+    syncTerminalTranscript,
+  ]);
+  // NOTE: sync-on-open (importing the transcript every time a thread is opened, to
+  // pick up external `c --resume` / `cc` sessions) is intentionally DISABLED. It ran
+  // the importer on every open and re-projected GUI-sent turns under a transcript-
+  // derived id, producing duplicate user bubbles. Terminal→GUI sync still runs on
+  // leaving terminal mode, and the importer now dedups against already-projected
+  // user prompts. Re-enable external-resume sync only once it's verified dup-free.
+  const queuedFollowUps = useMessageQueueStore((store) =>
+    activeThreadKey ? (store.queues[activeThreadKey] ?? EMPTY_QUEUE) : EMPTY_QUEUE,
+  );
+  const activeGoal = useGoalStore((store) =>
+    activeThreadKey ? store.goals[activeThreadKey] : undefined,
+  );
   const [timelineAnchor, setTimelineAnchor] = useState<{
     readonly threadKey: string | null;
     readonly messageId: MessageId | null;
@@ -1811,6 +1948,23 @@ function ChatViewContent(props: ChatViewProps) {
     threadError,
   });
   const isWorking = phase === "running" || isSendBusy || isConnecting || isRevertingCheckpoint;
+  // The send anchor pins a freshly sent message near the top while its response
+  // streams into the reserved end-space. It must be released once the turn settles:
+  // otherwise it lingers for the whole thread session, and the anchored end-space
+  // keeps constraining the virtualized list, so scrolling back down after reading
+  // history feels blocked. `!latestTurnSettled` keeps this true for the whole turn
+  // (robust to transient `isWorking` flicker); we only clear on the settle edge.
+  const turnInProgress = isWorking || !latestTurnSettled;
+  const previousTurnInProgressRef = useRef(false);
+  useEffect(() => {
+    const wasInProgress = previousTurnInProgressRef.current;
+    previousTurnInProgressRef.current = turnInProgress;
+    if (wasInProgress && !turnInProgress) {
+      setTimelineAnchor((current) =>
+        current.messageId === null ? current : { ...current, messageId: null },
+      );
+    }
+  }, [turnInProgress]);
   const activeWorkStartedAt = deriveActiveWorkStartedAt(
     activeLatestTurn,
     activeThread?.session ?? null,
@@ -3155,11 +3309,9 @@ function ChatViewContent(props: ChatViewProps) {
   }, []);
   const positionedTimelineAnchorRef = useRef<MessageId | null>(null);
   const settledTimelineAnchorRef = useRef<MessageId | null>(null);
-  const pendingAnchorScrollRestoreRef = useRef<{
-    readonly messageId: MessageId;
-    readonly offset: number;
-  } | null>(null);
-  const anchorScrollRestoreFrameRef = useRef<number | null>(null);
+  // Which anchor we've already done the post-settle scroll compensation for, so we
+  // do it at most once per anchor instead of on every size change.
+  const anchorSizeRestoredForRef = useRef<MessageId | null>(null);
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {
     if (positionedTimelineAnchorRef.current === messageId) {
       return;
@@ -3206,22 +3358,22 @@ function ChatViewContent(props: ChatViewProps) {
     if (settledTimelineAnchorRef.current !== messageId) {
       return;
     }
+    // The anchored end-space recomputes its size on every streamed token, firing
+    // this callback constantly. Restoring scroll on each one re-pins scrollTop and
+    // makes it impossible to scroll down during a turn. The anchor MESSAGE itself
+    // doesn't resize mid-stream, so a single post-settle compensation is enough —
+    // do it once per anchor, then leave the user's scroll alone.
+    if (anchorSizeRestoredForRef.current === messageId) {
+      return;
+    }
+    anchorSizeRestoredForRef.current = messageId;
     const scrollOffset = legendListRef.current?.getState().scroll;
     if (scrollOffset === undefined) {
       return;
     }
-    if (pendingAnchorScrollRestoreRef.current === null) {
-      pendingAnchorScrollRestoreRef.current = { messageId, offset: scrollOffset };
-    }
-    if (anchorScrollRestoreFrameRef.current !== null) {
-      return;
-    }
-    anchorScrollRestoreFrameRef.current = requestAnimationFrame(() => {
-      anchorScrollRestoreFrameRef.current = null;
-      const pending = pendingAnchorScrollRestoreRef.current;
-      pendingAnchorScrollRestoreRef.current = null;
-      if (pending && settledTimelineAnchorRef.current === pending.messageId) {
-        void legendListRef.current?.scrollToOffset({ offset: pending.offset, animated: false });
+    requestAnimationFrame(() => {
+      if (settledTimelineAnchorRef.current === messageId) {
+        void legendListRef.current?.scrollToOffset({ offset: scrollOffset, animated: false });
       }
     });
   }, []);
@@ -3653,14 +3805,22 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
-    if (
-      !activeThread ||
-      isSendBusy ||
-      isConnecting ||
-      activeEnvironmentUnavailable ||
-      sendInFlightRef.current
-    )
-      return;
+    if (!activeThread || activeEnvironmentUnavailable || sendInFlightRef.current) return;
+    // Immersive terminal mode owns the session: block any GUI send (single-writer).
+    if (threadViewModeValue === "terminal") return;
+    // Claude-Code-style: queue messages typed while the agent is still working
+    // instead of blocking them; they auto-send once the active turn finishes.
+    if ((phase === "running" || isSendBusy) && activeThreadKey && !activePendingProgress) {
+      const queuedText = promptRef.current;
+      if (queuedText.trim().length > 0) {
+        useMessageQueueStore.getState().enqueue(activeThreadKey, queuedText);
+        promptRef.current = "";
+        clearComposerDraftContent(composerDraftTarget);
+        composerRef.current?.resetCursorState();
+        return;
+      }
+    }
+    if (isSendBusy || isConnecting) return;
     if (activePendingProgress) {
       onAdvanceActivePendingUserInput();
       return;
@@ -3694,6 +3854,15 @@ function ChatViewContent(props: ChatViewProps) {
         composerPreviewAnnotations.length +
         composerReviewComments.length,
     });
+    // Mirror "/goal <text>" into a pinned per-thread goal (the command still
+    // sends through to the provider). Bare "/goal", "/goal clear"/"reset" clears.
+    if (activeThreadKey) {
+      const parsedGoal = parseGoalCommand(trimmed);
+      if (parsedGoal !== null) {
+        if (parsedGoal === "") useGoalStore.getState().clearGoal(activeThreadKey);
+        else useGoalStore.getState().setGoal(activeThreadKey, parsedGoal);
+      }
+    }
     if (showPlanFollowUpPrompt && activeProposedPlan) {
       const followUp = resolvePlanFollowUpSubmission({
         draftText: trimmed,
@@ -4009,6 +4178,36 @@ function ChatViewContent(props: ChatViewProps) {
       resetLocalDispatch();
     }
   };
+
+  const onSendRef = useRef(onSend);
+  onSendRef.current = onSend;
+  // Drain the per-thread message queue: when the agent goes idle, auto-send the
+  // queued follow-ups. All queued messages are flushed together as a single turn
+  // (Claude-Code-style) rather than one-by-one. Also covers the Tab-interrupt case.
+  useEffect(() => {
+    if (!activeThreadKey) return;
+    // Never auto-send while the thread is driven by the immersive terminal: the PTY
+    // `claude` owns the session, and a GUI turn would be a second writer (corruption).
+    if (threadViewModeValue === "terminal") return;
+    if (phase === "running" || isSendBusy || isConnecting || sendInFlightRef.current) return;
+    if (activePendingProgress) return;
+    const queued = useMessageQueueStore.getState().takeAll(activeThreadKey);
+    if (queued.length === 0) return;
+    const combined = queued.join("\n\n");
+    promptRef.current = combined;
+    setComposerDraftPrompt(composerDraftTarget, combined);
+    composerRef.current?.resetCursorState({ prompt: combined });
+    void onSendRef.current();
+  }, [
+    activeThreadKey,
+    threadViewModeValue,
+    phase,
+    isSendBusy,
+    isConnecting,
+    activePendingProgress,
+    composerDraftTarget,
+    setComposerDraftPrompt,
+  ]);
 
   const onInterrupt = async () => {
     if (!activeThread) return;
@@ -4775,6 +4974,62 @@ function ChatViewContent(props: ChatViewProps) {
     ) : null
   ) : null;
 
+  // Immersive terminal mode replaces the whole chat body (message list + composer) with the
+  // real `claude` TUI resumed on the same session. While entering, show a spinner until the
+  // resume info resolves; revert to GUI happens in the resume-info effect when not claude.
+  const showTerminalPane = threadViewModeValue === "terminal" && activeThreadRef !== null;
+  // The PTY runs `claude --resume <id>` as its root process. The TerminalManager wraps this
+  // in the user's login shell server-side so claude resolves on the real user PATH (the
+  // server runs with a minimal Finder PATH).
+  // Resume inherits the session's persisted effort (often `low` on older threads),
+  // so pass `--effort` explicitly to match the thread's GUI selection. `xhigh` only
+  // exists on the latest Opus/Fable models; clamp to `high` elsewhere. `ultracode`
+  // maps to `xhigh`; `ultrathink` is a prompt modifier, not a CLI effort level.
+  const terminalModel = activeThread?.modelSelection.model ?? null;
+  const terminalModelSupportsXhigh =
+    terminalModel === "claude-fable-5" ||
+    terminalModel === "claude-opus-4-8" ||
+    terminalModel === "claude-opus-4-7";
+  const rawThreadEffort = getModelSelectionStringOptionValue(
+    activeThread?.modelSelection,
+    "effort",
+  );
+  const mappedThreadEffort =
+    rawThreadEffort === "ultracode"
+      ? "xhigh"
+      : rawThreadEffort === "ultrathink"
+        ? undefined
+        : rawThreadEffort;
+  const resolvedTerminalEffort = mappedThreadEffort ?? (terminalModelSupportsXhigh ? "xhigh" : "high");
+  const terminalEffort =
+    resolvedTerminalEffort === "xhigh" && !terminalModelSupportsXhigh
+      ? "high"
+      : resolvedTerminalEffort;
+  const terminalLaunchCommand: TerminalLaunchCommand | undefined = terminalResumeInfo
+    ? {
+        shell: terminalResumeInfo.binaryPath,
+        args: [
+          ...(terminalResumeInfo.sessionId
+            ? ["--resume", terminalResumeInfo.sessionId]
+            : ["--continue"]),
+          "--effort",
+          terminalEffort,
+          // Match the thread's GUI permission posture in the immersive TUI. The GUI
+          // default (full-access) maps to bypassPermissions, so without this the
+          // terminal would prompt for every action the GUI auto-approves. An explicit
+          // approval-required thread keeps the CLI's normal prompting.
+          ...(runtimeMode === "full-access" ? ["--dangerously-skip-permissions"] : []),
+        ],
+      }
+    : undefined;
+  const canRenderTerminalPane =
+    showTerminalPane &&
+    terminalResumeInfo !== null &&
+    terminalResumeInfo.isClaude &&
+    gitCwd !== null &&
+    activeThreadRef !== null &&
+    terminalLaunchCommand !== undefined;
+
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
       {rightPanelOpen && !shouldUsePlanSidebarSheet ? panelLayoutControls : null}
@@ -4834,6 +5089,39 @@ function ChatViewContent(props: ChatViewProps) {
         <div className="flex min-h-0 min-w-0 flex-1">
           {/* Chat column */}
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            {showTerminalPane ? (
+              canRenderTerminalPane && activeThreadRef ? (
+                <div className="relative flex min-h-0 min-w-0 flex-1 flex-col px-2 pt-1 pb-[calc(env(safe-area-inset-bottom)+0.75rem)]">
+                  <TerminalViewport
+                    threadRef={activeThreadRef}
+                    threadId={activeThreadRef.threadId}
+                    terminalId={AGENT_CLAUDE_TERMINAL_ID}
+                    terminalLabel="claude"
+                    cwd={gitCwd ?? ""}
+                    {...(terminalLaunchCommand ? { launchCommand: terminalLaunchCommand } : {})}
+                    {...(terminalResumeInfo?.homeOverride
+                      ? { runtimeEnv: { HOME: terminalResumeInfo.homeOverride } }
+                      : {})}
+                    keybindings={keybindings}
+                    autoFocus
+                    focusRequestId={0}
+                    // Re-fit the terminal when the side panel opens/closes/maximizes so
+                    // it always reflows to the real available width.
+                    resizeEpoch={(rightPanelOpen ? 1 : 0) + (rightPanelMaximized ? 2 : 0)}
+                    drawerHeight={600}
+                    onAddTerminalContext={() => undefined}
+                    onSessionExited={() => {
+                      useThreadViewModeStore.getState().setMode("gui");
+                    }}
+                  />
+                </div>
+              ) : (
+                <div className="flex min-h-0 flex-1 items-center justify-center">
+                  <Spinner className="size-5" aria-hidden />
+                </div>
+              )
+            ) : (
+              <>
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
@@ -4906,6 +5194,47 @@ function ChatViewContent(props: ChatViewProps) {
                 <div className="pointer-events-auto relative z-10 isolate">
                   <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
                   <div className="relative z-10">
+                    {activeGoal && activeThreadKey ? (
+                      <div className="mb-1.5 flex items-center px-1">
+                        <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] text-foreground/90">
+                          <span className="shrink-0 text-[9px] font-medium uppercase tracking-wider text-primary/80">
+                            Goal
+                          </span>
+                          <span className="truncate">{activeGoal}</span>
+                          <button
+                            type="button"
+                            onClick={() => useGoalStore.getState().clearGoal(activeThreadKey)}
+                            title="Effacer le goal"
+                            className="shrink-0 opacity-50 transition-opacity hover:opacity-100"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      </div>
+                    ) : null}
+                    {queuedFollowUps.length > 0 && activeThreadKey ? (
+                      <div className="mb-1.5 flex flex-wrap items-center gap-1.5 px-1">
+                        <span className="text-[11px] font-medium text-muted-foreground/60">
+                          {queuedFollowUps.length} en file
+                        </span>
+                        {queuedFollowUps.map((message, index) => (
+                          <button
+                            key={`${index}-${message}`}
+                            type="button"
+                            onClick={() =>
+                              useMessageQueueStore.getState().removeAt(activeThreadKey, index)
+                            }
+                            title="Retirer de la file"
+                            className="group inline-flex max-w-52 items-center gap-1 rounded-full border border-border/70 bg-background/80 px-2 py-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                          >
+                            <span className="truncate">{message}</span>
+                            <span className="opacity-50 transition-opacity group-hover:opacity-100">
+                              ×
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
                     <ChatComposer
                       composerRef={composerRef}
                       composerDraftTarget={composerDraftTarget}
@@ -4988,6 +5317,57 @@ function ChatViewContent(props: ChatViewProps) {
                     : "pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:pb-[calc(env(safe-area-inset-bottom)+1rem)]",
                 )}
               >
+                {runningTerminalIds.length > 0 && activeThreadRef ? (
+                  <div className="pointer-events-auto mb-1.5 flex flex-wrap items-center gap-1.5">
+                    {activeThreadKnownSessions
+                      .filter((session) => runningTerminalIds.includes(session.target.terminalId))
+                      .map((session) => {
+                        const runningTerminalRef = activeThreadRef;
+                        const terminalId = session.target.terminalId;
+                        const label = session.state.summary?.label?.trim() || "shell";
+                        return (
+                          <div
+                            key={terminalId}
+                            className="group flex items-center gap-1.5 rounded-full border border-border/60 bg-background/80 py-0.5 pr-1 pl-2 text-[11px] shadow-sm/5"
+                          >
+                            <span className="relative flex size-1.5 shrink-0">
+                              <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500/70" />
+                              <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                storeSetActiveTerminal(runningTerminalRef, terminalId);
+                                storeSetTerminalOpen(runningTerminalRef, true);
+                              }}
+                              title="Voir le terminal"
+                              className="max-w-40 truncate font-medium text-foreground/80 hover:text-foreground"
+                            >
+                              {label}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void closeTerminalMutation({
+                                  environmentId: runningTerminalRef.environmentId,
+                                  input: {
+                                    threadId: runningTerminalRef.threadId,
+                                    terminalId,
+                                    deleteHistory: true,
+                                  },
+                                });
+                                storeCloseTerminal(runningTerminalRef, terminalId);
+                              }}
+                              title="Arrêter le shell"
+                              className="inline-flex size-4 items-center justify-center rounded-full text-muted-foreground/60 transition-colors hover:bg-destructive/15 hover:text-destructive"
+                            >
+                              <XIcon className="size-3" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                  </div>
+                ) : null}
                 {isGitRepo && (
                   <div className="pointer-events-auto">
                     <BranchToolbar
@@ -5018,6 +5398,8 @@ function ChatViewContent(props: ChatViewProps) {
                 )}
               </div>
             </div>
+              </>
+            )}
 
             {pullRequestDialogState ? (
               <PullRequestThreadDialog

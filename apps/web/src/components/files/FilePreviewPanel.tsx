@@ -811,7 +811,7 @@ export default function FilePreviewPanel({
           Preview limited to the first 1 MB of a {file.data.byteLength.toLocaleString()} byte file.
         </div>
       ) : null}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div className="relative flex min-h-0 flex-1 overflow-hidden">
         <div
           className={cn(
             "min-w-0 flex-1 flex-col overflow-hidden",
@@ -879,12 +879,23 @@ export default function FilePreviewPanel({
             )
           ) : null}
         </div>
+        {/* When a file is open, the explorer is a floating drawer over the editor (with a
+            dismiss backdrop) instead of a column that squeezes the editor into an
+            unreadable sliver. With no file open it stays a full-width tree. */}
+        {explorerOpen && relativePath ? (
+          <button
+            type="button"
+            aria-label="Close file explorer"
+            className="absolute inset-0 z-10 cursor-default bg-black/20"
+            onClick={() => setExplorerOpen(false)}
+          />
+        ) : null}
         {explorerOpen || relativePath === null ? (
           <aside
             className={cn(
               "flex min-h-0 shrink-0 bg-background",
               relativePath
-                ? "w-[min(22rem,46%)] min-w-64 border-l border-border/60"
+                ? "absolute inset-y-0 right-0 z-20 w-[min(20rem,85%)] border-l border-border/60 shadow-2xl"
                 : "min-w-0 flex-1",
             )}
           >
@@ -893,7 +904,10 @@ export default function FilePreviewPanel({
               environmentId={environmentId}
               cwd={cwd}
               projectName={projectName}
-              onOpenFile={onOpenFile}
+              onOpenFile={(path) => {
+                setExplorerOpen(false);
+                onOpenFile(path);
+              }}
             />
           </aside>
         ) : null}

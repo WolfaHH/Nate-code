@@ -37,7 +37,7 @@
 @theme inline {
   --animate-skeleton: skeleton 2s -1s infinite linear;
   --font-sans:
-    "DM Sans Variable", "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    "Hanken Grotesk", "DM Sans Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
     sans-serif;
   --font-mono:
     "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
@@ -66,6 +66,8 @@
   --color-card: var(--card);
   --color-foreground: var(--foreground);
   --color-background: var(--background);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -94,6 +96,8 @@
   }
   html {
     background-color: var(--app-chrome-background);
+    /* One notch up so chat + UI text reads a touch larger, everything to scale. */
+    font-size: 112.5%;
   }
   body {
     @apply text-foreground relative;
@@ -253,22 +257,34 @@
   --success-foreground: var(--color-emerald-700);
   --warning: var(--color-amber-500);
   --warning-foreground: var(--color-amber-700);
+  --sidebar: var(--color-neutral-50);
+  --sidebar-foreground: var(--foreground);
 
   @variant dark {
     color-scheme: dark;
-    --background: color-mix(in srgb, var(--color-neutral-950) 95%, var(--color-white));
-    --app-chrome-background: var(--background);
-    --foreground: var(--color-neutral-100);
-    --card: color-mix(in srgb, var(--background) 98%, var(--color-white));
+    /* macOS vibrancy: the main surfaces are translucent so the frosted backdrop (the
+       desktop/apps behind the window) shows through. Driven by the "Window opacity"
+       setting: 100% = fully opaque = no see-through (default, zero visual change);
+       lower it to reveal the frost. Cards/popovers/menus stay opaque (literal #111111)
+       so floating content over the frost stays readable. */
+    --surface-opacity: 100%;
+    --background: color-mix(in srgb, #111111 var(--surface-opacity, 100%), transparent);
+    /* html/body carry NO tint of their own — otherwise body + the content panel + the
+       sidebar would each add a translucent layer and stack into ~full opacity (the
+       "lowered it, still nothing" bug). Keeping the base transparent makes --background
+       and --sidebar each a SINGLE translucent layer over the vibrancy backdrop. */
+    --app-chrome-background: transparent;
+    --foreground: var(--color-neutral-50);
+    --card: color-mix(in srgb, #111111 98%, var(--color-white));
     --card-foreground: var(--color-neutral-100);
-    --popover: color-mix(in srgb, var(--background) 98%, var(--color-white));
+    --popover: color-mix(in srgb, #111111 98%, var(--color-white));
     --popover-foreground: var(--color-neutral-100);
     --primary: oklch(0.588 0.217 264);
     --primary-foreground: var(--color-white);
     --secondary: --alpha(var(--color-white) / 4%);
     --secondary-foreground: var(--color-neutral-100);
     --muted: --alpha(var(--color-white) / 4%);
-    --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-white));
+    --muted-foreground: color-mix(in srgb, var(--color-neutral-400) 82%, var(--color-white));
     --accent: --alpha(var(--color-white) / 4%);
     --accent-foreground: var(--color-neutral-100);
     --destructive: color-mix(in srgb, var(--color-red-500) 90%, var(--color-white));
@@ -282,13 +298,15 @@
     --success-foreground: var(--color-emerald-400);
     --warning: var(--color-amber-500);
     --warning-foreground: var(--color-amber-400);
+    --sidebar: color-mix(in srgb, #181818 var(--surface-opacity, 100%), transparent);
+    --sidebar-foreground: var(--foreground);
   }
 }
 
 body {
   font-family:
+    "Hanken Grotesk",
     "DM Sans Variable",
-    "DM Sans",
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
@@ -398,6 +416,21 @@ code {
 .thread-terminal-drawer .xterm .xterm-scrollable-element > .scrollbar.vertical > .slider {
   width: 6px !important;
   left: 0 !important;
+}
+
+/* Claude's TUI paints its text with explicit 256-color / truecolor escapes, so the
+   xterm theme palette never reaches it -- editing `red`/`foreground` does nothing
+   visible. A brightness + saturation pass on the rendered output layer is the only
+   lever that lifts ALL of claude's text (and every other program's) toward crisp,
+   vivid white. `.xterm-screen` is the common output container for both renderers --
+   the WebGL <canvas> and the DOM-fallback `.xterm-rows` both live inside it -- so the
+   filter applies exactly once regardless of which renderer is active. The near-black
+   background canvas lifts imperceptibly. Tune the two multipliers to taste. */
+.thread-terminal-drawer .xterm .xterm-screen {
+  /* Very light softening: pull pure whites just off the 255 clip so they read as a
+     soft off-white instead of a hard white, keeping a touch of saturation so colors
+     stay alive (not dull). Tune `brightness` down for more softening. */
+  filter: brightness(0.97) saturate(1.06);
 }
 
 /* Reasoning select -- clickable label surface */

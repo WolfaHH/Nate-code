@@ -6,6 +6,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 
 import type * as Electron from "electron";
+import { screen } from "electron";
 
 import * as DesktopAssets from "../app/DesktopAssets.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
@@ -169,7 +170,11 @@ function syncWindowAppearance(
       return;
     }
 
-    window.setBackgroundColor(getInitialWindowBackgroundColor(shouldUseDarkColors));
+    // On macOS the window stays transparent for vibrancy — re-painting an opaque
+    // background here would cover the frosted backdrop.
+    if (platform !== "darwin") {
+      window.setBackgroundColor(getInitialWindowBackgroundColor(shouldUseDarkColors));
+    }
     const { titleBarOverlay } = getWindowTitleBarOptions(shouldUseDarkColors, platform);
     if (typeof titleBarOverlay === "object") {
       window.setTitleBarOverlay(titleBarOverlay);
@@ -250,15 +255,36 @@ export const make = Effect.gen(function* () {
     const iconPaths = yield* assets.iconPaths;
     const iconOption = getIconOption(iconPaths, environment.platform);
     const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
+    // Open large by default: ~92% of the work-area width (wider is the ask) and
+    // ~90% of the height (almost full-screen, but a touch less). Floored at the
+    // previous defaults and capped to the display so it never overflows.
+    const workArea = screen.getPrimaryDisplay().workAreaSize;
+    const defaultWidth = Math.min(workArea.width, Math.max(1100, Math.round(workArea.width * 0.92)));
+    const defaultHeight = Math.min(workArea.height, Math.max(780, Math.round(workArea.height * 0.9)));
     const window = yield* electronWindow.create({
-      width: 1100,
-      height: 780,
+      width: defaultWidth,
+      height: defaultHeight,
+      center: true,
       minWidth: 840,
       minHeight: 620,
       show: false,
       autoHideMenuBar: true,
       ...(environment.platform === "darwin" ? { disableAutoHideCursor: true } : {}),
-      backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors),
+      // macOS: transparent window background + native vibrancy ("under-window" frosts
+      // the desktop/apps behind the window). How much shows through is decided by the
+      // web surfaces via --surface-opacity. Other platforms keep the opaque chrome color.
+      ...(environment.platform === "darwin"
+        ? {
+            // `transparent: true` is required on macOS for the vibrancy material to
+            // actually composite — with it omitted the window stays opaque and the
+            // frost never shows (Electron #31862). Rounded corners + shadow still come
+            // from the vibrancy view.
+            transparent: true,
+            backgroundColor: "#00000000",
+            vibrancy: "under-window" as const,
+            visualEffectState: "active" as const,
+          }
+        : { backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors) }),
       ...iconOption,
       title: environment.displayName,
       ...getWindowTitleBarOptions(shouldUseDarkColors, environment.platform),
@@ -274,6 +300,15 @@ export const make = Effect.gen(function* () {
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
     }
+
+    // Grant the app's own renderer the permissions it requests — notably the
+    // microphone, used by voice dictation in the composer. Without a handler
+    // Electron denies getUserMedia. The preview <webview> runs in a separate
+    // partition/session and is unaffected by this.
+    window.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => {
+      callback(true);
+    });
+    window.webContents.session.setPermissionCheckHandler(() => true);
 
     yield* previewManager.setMainWindow(window);
     window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
